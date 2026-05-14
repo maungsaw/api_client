@@ -1,0 +1,12 @@
+name: apiclient
+description: "API Call project."
+version: 0.2.9
+
+environment:
+  sdk: ^3.9.2
+  flutter: ">=1.17.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  dio:
