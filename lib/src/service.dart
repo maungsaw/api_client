@@ -1,13 +1,91 @@
 import 'package:apiclient/src/model.dart'
     show RPCAuthResponse, ClientGetRequest, RPCCompany, ClientListResponse, ClientResponse, ClientRPCPostRequest, QueryParamSerializable, OdooErrorResponse;
-import 'package:dio/dio.dart' show Dio, DioException, Options;
+import 'package:dio/dio.dart' show Dio, DioException, Options, QueuedInterceptorsWrapper;
+import 'package:dio_cookie_manager/dio_cookie_manager.dart';
+import 'package:cookie_jar/cookie_jar.dart';
 import 'package:flutter/rendering.dart' show debugPrint;
 
-/// Service
-mixin ApiClientService {
-  final dio = Dio();
+/// Base Service Client with Auto Session Refresh
+abstract class ApiClientService {
+  // Singleton သို့မဟုတ် Shared Instance အဖြစ် သုံးနိုင်ရန် Dio ကို Setup လုပ်ပါသည်
+  final Dio dio = Dio();
+  final CookieJar cookieJar = CookieJar();
 
-  Future<RPCAuthResponse> authRPC({required String username, required String password, required String database, required String baseUrl}) async {
+  // Auto Login ပြန်ဝင်ရန်အတွက် သိမ်းထားမည့် အချက်အလက်များ
+  String? _savedUsername;
+  String? _savedPassword;
+  String? _savedDatabase;
+  String? _savedBaseUrl;
+
+  ApiClientService() {
+    // CookieManager ထည့်သွင်းခြင်းဖြင့် Cookie များကို ဖိုင်/မန်မိုရီထဲ အလိုအလျောက် မှတ်ထားမည်
+    dio.interceptors.add(CookieManager(cookieJar));
+
+    // Session သက်တမ်းကုန်ပါက ကြားဖြတ်ဖမ်းယူမည့် Interceptor
+    dio.interceptors.add(QueuedInterceptorsWrapper(
+      onResponse: (response, handler) async {
+        if (response.data is Map && response.data['error'] != null) {
+          final errorData = response.data['error']['data'];
+          final errorName = errorData?['name'] ?? "";
+
+          // Odoo Session Expired ဖြစ်သွားကြောင်း စစ်ဆေးခြင်း
+          if (errorName == 'odoo.http.SessionExpiredException' || errorName.contains('SessionExpired')) {
+            debugPrint('⚠️ Odoo Session Expired! Attempting auto-login refresh...');
+
+            // နောက်ကွယ်ကနေ Login အသစ် ပြန်ဝင်ခြင်း
+            bool isRefreshed = await _refreshSession();
+
+            if (isRefreshed) {
+              debugPrint('🔄 Session refreshed successfully. Retrying original request.');
+              // ရရှိလာသည့် Cookie အသစ်ဖြင့် ယခင်ပျက်သွားသော Request ကို အသစ်ပြန်ပို့ခြင်း
+              final requestOptions = response.requestOptions;
+              final cloneResponse = await dio.fetch(requestOptions);
+              return handler.resolve(cloneResponse);
+            }
+          }
+        }
+        return handler.next(response);
+      },
+    ));
+  }
+
+  // Session သက်တမ်းကုန်ချိန်တွင် ခေါ်မည့် သီးသန့် အလိုအလျောက် Login Function
+  Future<bool> _refreshSession() async {
+    if (_savedUsername == null || _savedPassword == null || _savedDatabase == null || _savedBaseUrl == null) {
+      return false;
+    }
+    try {
+      await cookieJar.deleteAll(); // ကွတ်ကီးအဟောင်းများ ဖျက်ပါ
+      final response = await dio.post(
+        '$_savedBaseUrl/web/session/authenticate',
+        data: {
+          'params': {
+            'db': _savedDatabase,
+            'login': _savedUsername,
+            'password': _savedPassword,
+            'context': {}
+          },
+        },
+      );
+      return response.statusCode == 200 && response.data['result'] != null;
+    } catch (e) {
+      debugPrint('❌ Auto login refresh failed: $e');
+      return false;
+    }
+  }
+
+  Future<RPCAuthResponse> authRPC({
+    required String username,
+    required String password,
+    required String database,
+    required String baseUrl,
+  }) async {
+    // တန်ဖိုးများကို သိမ်းဆည်းထားမည် (Timeout ဖြစ်လျှင် ပြန်သုံးရန်)
+    _savedUsername = username;
+    _savedPassword = password;
+    _savedDatabase = database;
+    _savedBaseUrl = baseUrl;
+
     RPCAuthResponse responseModel = RPCAuthResponse('Authentication failed');
     try {
       final response = await dio.post(
@@ -21,7 +99,11 @@ mixin ApiClientService {
         final result = response.data['result'];
 
         if (result != null) {
-          final cookieString = _extractCookies(response.headers.map['set-cookie']);
+          // CookieManager သုံးထားသဖြင့် _extractCookies လုပ်ရန် မလိုတော့ပါ။ (Memory ထဲ သိမ်းပြီးသားဖြစ်သည်)
+          // လိုအပ်ပါက အောက်ပါအတိုင်း ကွတ်ကီးကို စာသားပြောင်းယူနိုင်သည်
+          final cookies = await cookieJar.loadForRequest(Uri.parse(baseUrl));
+          final cookieString = cookies.map((c) => '${c.name}=${c.value}').join('; ');
+
           String? companyId;
           String? salesTeamGroupId;
           RPCCompany? company;
@@ -37,7 +119,6 @@ mixin ApiClientService {
 
           final userId = result['uid'];
 
-          // Update using copyWith
           responseModel = responseModel.copyWith(
             message: 'Success',
             cookie: cookieString,
@@ -63,15 +144,17 @@ mixin ApiClientService {
     return responseModel;
   }
 
-  Future<ClientResponse> changePasswordRPC(String oldValue, String newValue, String baseUrl, String cookies, String model) async {
+  // သတိပြုရန် - CookieManager သုံးထားသဖြင့် အောက်ပါ function များတွင် 'String cookies' parameter ထည့်ပေးရန် မလိုတော့ပါ။
+  // dio မှ အလိုအလျောက် Header ထဲ ထည့်ပေးသွားမည် ဖြစ်သည်။
+
+  Future<ClientResponse> changePasswordRPC(String oldValue, String newValue, String baseUrl, String model) async {
     try {
       final response = await dio.post(
         '$baseUrl/web/dataset/call_kw',
-        options: Options(headers: {'Cookie': '$cookies'}),
         data: {
           "jsonrpc": "2.0",
           "params": {
-            "model": model, // Usually the model for password changes
+            "model": model,
             "method": "change_password",
             "args": [oldValue, newValue],
             "kwargs": {},
@@ -85,9 +168,6 @@ mixin ApiClientService {
           final errorName = odooRes.error?.data.name;
           final errorCode = odooRes.error?.code;
           final errorMessage = odooRes.error?.message ?? "Unknown Odoo Error";
-          if (errorName == 'odoo.http.SessionExpiredException') {
-            return ClientResponse(statusCode: 401, message: "Session Expired. Please login again.", data: null);
-          }
           if (errorName == 'odoo.exceptions.AccessDenied') {
             return ClientResponse(statusCode: 403, message: "Access Denied. Check permissions or login.", data: null);
           }
@@ -100,26 +180,23 @@ mixin ApiClientService {
           return ClientResponse(statusCode: 500, message: "Unexpected response format", data: null);
         }
       } else {
-        return ClientResponse(statusCode: response.statusCode ?? 500, message: response.statusMessage ?? "Failed to create", data: null);
+        return ClientResponse(statusCode: response.statusCode ?? 500, message: response.statusMessage ?? "Failed to update", data: null);
       }
     } on DioException catch (e) {
       return ClientResponse(statusCode: e.response?.statusCode ?? 500, message: e.message ?? "Unknown Dio error", data: null);
     }
   }
 
-  Future<ClientResponse> deactivateRPC(int id, String baseUrl, String cookies, String model) async {
+  Future<ClientResponse> deactivateRPC(int id, String baseUrl, String model) async {
     try {
       final response = await dio.post(
         '$baseUrl/web/dataset/call_kw',
-        options: Options(headers: {'Cookie': '$cookies'}),
         data: {
           "jsonrpc": "2.0",
           "params": {
             "model": model,
             "method": "unlink",
-            "args": [
-              [id],
-            ],
+            "args": [[id]],
             "kwargs": {},
           },
         },
@@ -131,9 +208,6 @@ mixin ApiClientService {
           final errorName = odooRes.error?.data.name;
           final errorCode = odooRes.error?.code;
           final errorMessage = odooRes.error?.message ?? "Unknown Odoo Error";
-          if (errorName == 'odoo.http.SessionExpiredException') {
-            return ClientResponse(statusCode: 401, message: "Session Expired. Please login again.", data: null);
-          }
           if (errorName == 'odoo.exceptions.AccessDenied') {
             return ClientResponse(statusCode: 403, message: "Access Denied. Check permissions or login.", data: null);
           }
@@ -146,7 +220,7 @@ mixin ApiClientService {
           return ClientResponse(statusCode: 500, message: "Unexpected response format", data: null);
         }
       } else {
-        return ClientResponse(statusCode: response.statusCode ?? 500, message: response.statusMessage ?? "Failed to create", data: null);
+        return ClientResponse(statusCode: response.statusCode ?? 500, message: response.statusMessage ?? "Failed", data: null);
       }
     } on DioException catch (e) {
       return ClientResponse(statusCode: e.response?.statusCode ?? 500, message: e.message ?? "Unknown Dio error", data: null);
@@ -154,7 +228,6 @@ mixin ApiClientService {
   }
 
   Future<ClientListResponse<T>> getAllRPC<T>({
-    required String cookies,
     required String baseUrl,
     required ClientGetRequest request,
     required T Function(Map<String, dynamic>) fromJson,
@@ -162,7 +235,6 @@ mixin ApiClientService {
     try {
       final response = await dio.post(
         '$baseUrl/web/dataset/call_kw',
-        options: Options(headers: {'Cookie': cookies}),
         data: request.toJson(),
       );
 
@@ -172,9 +244,6 @@ mixin ApiClientService {
           final errorName = odooRes.error?.data.name;
           final errorCode = odooRes.error?.code;
           final errorMessage = odooRes.error?.message ?? "Unknown Odoo Error";
-          if (errorName == 'odoo.http.SessionExpiredException') {
-            return ClientListResponse(statusCode: 401, message: "Session Expired. Please login again.", data: []);
-          }
           if (errorName == 'odoo.exceptions.AccessDenied') {
             return ClientListResponse(statusCode: 403, message: "Access Denied. Check permissions or login.", data: []);
           }
@@ -194,7 +263,6 @@ mixin ApiClientService {
   }
 
   Future<ClientResponse<T>> getRPC<T>({
-    required String cookies,
     required String baseUrl,
     required ClientGetRequest request,
     required T Function(Map<String, dynamic>) fromJson,
@@ -202,7 +270,6 @@ mixin ApiClientService {
     try {
       final response = await dio.post(
         '$baseUrl/web/dataset/call_kw',
-        options: Options(headers: {'Cookie': cookies}),
         data: request.toJson(),
       );
       if (response.statusCode == 200) {
@@ -211,9 +278,6 @@ mixin ApiClientService {
           final errorName = odooRes.error?.data.name;
           final errorCode = odooRes.error?.code;
           final errorMessage = odooRes.error?.message ?? "Unknown Odoo Error";
-          if (errorName == 'odoo.http.SessionExpiredException') {
-            return ClientResponse(statusCode: 401, message: "Session Expired. Please login again.", data: null);
-          }
           if (errorName == 'odoo.exceptions.AccessDenied') {
             return ClientResponse(statusCode: 403, message: "Access Denied. Check permissions or login.", data: null);
           }
@@ -227,13 +291,12 @@ mixin ApiClientService {
     } on DioException catch (e) {
       debugPrint('Error during data fetch: $e');
       return ClientResponse(statusCode: 500, message: e.message ?? "$e", data: null);
-    } on Exception catch (e) {
+    } catch (e) {
       return ClientResponse(statusCode: 500, message: e.toString(), data: null);
     }
   }
 
   Future<ClientListResponse<T>> getCustomRPC<T>({
-    required String cookies,
     required String baseUrl,
     required Map<String, dynamic> request,
     required T Function(Map<String, dynamic>) fromJson,
@@ -241,7 +304,6 @@ mixin ApiClientService {
     try {
       final response = await dio.post(
         baseUrl,
-        options: Options(headers: {'Cookie': cookies}),
         data: request,
       );
       if (response.statusCode == 200) {
@@ -250,9 +312,6 @@ mixin ApiClientService {
           final errorName = odooRes.error?.data.name;
           final errorCode = odooRes.error?.code;
           final errorMessage = odooRes.error?.message ?? "Unknown Odoo Error";
-          if (errorName == 'odoo.http.SessionExpiredException') {
-            return ClientListResponse(statusCode: 401, message: "Session Expired. Please login again.", data: []);
-          }
           if (errorName == 'odoo.exceptions.AccessDenied') {
             return ClientListResponse(statusCode: 403, message: "Access Denied. Check permissions or login.", data: []);
           }
@@ -274,16 +333,15 @@ mixin ApiClientService {
     } on DioException catch (e) {
       debugPrint('Error during data fetch: $e');
       return ClientListResponse(statusCode: 500, message: e.message ?? "$e", data: []);
-    } on Exception catch (e) {
+    } catch (e) {
       return ClientListResponse(statusCode: 500, message: e.toString(), data: []);
     }
   }
 
-  Future<ClientResponse<T>> createRPC<T>(ClientRPCPostRequest request, String cookie, String baseUrl) async {
+  Future<ClientResponse<T>> createRPC<T>(ClientRPCPostRequest request, String baseUrl) async {
     try {
       final response = await dio.post(
         '$baseUrl/web/dataset/call_kw',
-        options: Options(headers: {'Cookie': cookie}),
         data: request.toJson(),
       );
 
@@ -293,16 +351,12 @@ mixin ApiClientService {
           final errorName = odooRes.error?.data.name;
           final errorCode = odooRes.error?.code;
           final errorMessage = odooRes.error?.data.message ?? "Unknown Odoo Error";
-          if (errorName == 'odoo.http.SessionExpiredException') {
-            return ClientResponse(statusCode: 401, message: "Session Expired. Please login again.", data: null);
-          }
           if (errorName == 'odoo.exceptions.AccessDenied' || errorName == 'odoo.exceptions.AccessError') {
             return ClientResponse(statusCode: 403, message: "Access Denied. Check permissions or ask your admin.", data: null);
           }
           if (errorName == 'odoo.exceptions.ValidationError' && errorMessage.contains("UUID and Salesperson must be unique")) {
             return ClientResponse(statusCode: 409, message: "Already synced (duplicate UUID)", data: null);
           }
-
           return ClientResponse(statusCode: errorCode ?? 400, message: errorMessage, data: null);
         }
         final data = response.data;
@@ -320,12 +374,14 @@ mixin ApiClientService {
     }
   }
 
+  // --- REST API Method များ (ထည့်သွင်းပြင်ဆင်ပြီး) ---
+
   Future<ClientListResponse<R>> getAllRest<T extends QueryParamSerializable, R>({
     required String url,
     required String token,
     required bool isList,
     required T queryModel,
-    required R Function(Map<String, dynamic>) fromJson, // R is the model type
+    required R Function(Map<String, dynamic>) fromJson,
   }) async {
     try {
       final response = await dio.get(
@@ -337,7 +393,6 @@ mixin ApiClientService {
       );
 
       if (response.statusCode == 200) {
-        debugPrint('status code ${response.data}');
         final List<dynamic> rawList = isList ? response.data : response.data['data'] ?? [];
         if (rawList.isEmpty) {
           return ClientListResponse<R>(statusCode: 200, message: "Success", data: []);
@@ -348,7 +403,6 @@ mixin ApiClientService {
         return ClientListResponse<R>(statusCode: response.statusCode ?? 500, message: "Failed", data: []);
       }
     } on DioException catch (e) {
-      debugPrint('Error fetching from $url: $e');
       return ClientListResponse<R>(statusCode: e.response?.statusCode ?? 500, message: e.message ?? "Unknown Dio error", data: []);
     }
   }
@@ -365,7 +419,6 @@ mixin ApiClientService {
         ? Options(receiveTimeout: const Duration(seconds: 5))
         : Options(headers: {'Authorization': 'Bearer $token'}, receiveTimeout: const Duration(seconds: 5));
 
-    // Safely join URL parts
     final String path = id == null ? endpoint : '$endpoint/$id';
     final String fullUrl = baseUrl.endsWith('/') ? '$baseUrl$path' : '$baseUrl/$path';
 
@@ -385,11 +438,7 @@ mixin ApiClientService {
       final response = await dio.delete('$baseUrl$param/$id', options: Options(receiveTimeout: const Duration(seconds: 5)));
       return ClientResponse(statusCode: response.statusCode ?? 200, message: response.statusMessage ?? 'Deleted', data: response.data);
     } on DioException catch (dioError) {
-      if (dioError.response != null) {
-        return ClientResponse(statusCode: dioError.response!.statusCode ?? 400, message: 'Server Error: ${dioError.message}', data: dioError.response!.data);
-      } else {
-        return ClientResponse(statusCode: 400, message: dioError.message ?? 'Dio Error', data: null);
-      }
+      return ClientResponse(statusCode: dioError.response?.statusCode ?? 400, message: 'Server Error: ${dioError.message}', data: dioError.response?.data);
     } catch (e) {
       return ClientResponse(statusCode: 500, message: e.toString(), data: null);
     }
@@ -403,11 +452,7 @@ mixin ApiClientService {
       final response = await dio.put(fullUrl, queryParameters: data is Map<String, dynamic> ? data : null, options: options);
       return ClientResponse(statusCode: response.statusCode ?? 200, message: response.statusMessage ?? 'Updated', data: response.data);
     } on DioException catch (dioError) {
-      if (dioError.response != null) {
-        return ClientResponse(statusCode: dioError.response!.statusCode ?? 400, message: 'Server Error: ${dioError.message}', data: dioError.response!.data);
-      } else {
-        return ClientResponse(statusCode: 400, message: 'Server Error: ${dioError.message}', data: null);
-      }
+      return ClientResponse(statusCode: dioError.response?.statusCode ?? 400, message: 'Server Error: ${dioError.message}', data: dioError.response?.data);
     } catch (e) {
       return ClientResponse(statusCode: 500, message: e.toString(), data: null);
     }
@@ -424,31 +469,9 @@ mixin ApiClientService {
 
       return ClientResponse(statusCode: response.statusCode ?? 200, message: response.statusMessage ?? 'Created', data: response.data);
     } on DioException catch (dioError) {
-      if (dioError.response != null) {
-        return ClientResponse(
-          statusCode: dioError.response!.statusCode ?? 400,
-          message: dioError.response!.statusMessage ?? 'Request Error',
-          data: dioError.response!.data,
-        );
-      } else {
-        return ClientResponse(statusCode: 500, message: 'Server Error: ${dioError.message}', data: null);
-      }
+      return ClientResponse(statusCode: dioError.response?.statusCode ?? 400, message: dioError.response?.statusMessage ?? 'Request Error', data: dioError.response?.data);
     } catch (e) {
       return ClientResponse(statusCode: 500, message: e.toString(), data: null);
     }
-  }
-
-  String? _extractCookies(List<String>? cookies) {
-    if (cookies == null || cookies.isEmpty) return null;
-
-    // Extract only the first occurrence of each cookie key
-    final Map<String, String> cookieMap = {};
-    for (var cookie in cookies) {
-      final keyValue = cookie.split(';').first.split('=');
-      if (keyValue.length == 2) {
-        cookieMap[keyValue[0].trim()] = keyValue[1].trim();
-      }
-    }
-    return cookieMap.entries.map((e) => '${e.key}=${e.value}').join('; ');
   }
 }

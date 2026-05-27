@@ -10,3 +10,5 @@ dependencies:
   flutter:
     sdk: flutter
   dio:
+  dio_cookie_manager: ^3.4.0
+  cookie_jar: ^4.0.9
