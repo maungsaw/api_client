@@ -1,91 +1,186 @@
+import 'dart:io' show Cookie; // 🔥 [CRITICAL] Cookie.fromSetCookieValue သုံးရန် လိုအပ်သည်
 import 'package:apiclient/src/model.dart'
     show RPCAuthResponse, ClientGetRequest, RPCCompany, ClientListResponse, ClientResponse, ClientRPCPostRequest, QueryParamSerializable, OdooErrorResponse;
-import 'package:dio/dio.dart' show Dio, DioException, Options, QueuedInterceptorsWrapper;
+import 'package:dio/dio.dart' show Dio, DioException, DioExceptionType, Options, QueuedInterceptorsWrapper;
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter/rendering.dart' show debugPrint;
 
-/// Base Service Client with Auto Session Refresh
+/// Base Service Client with Fully Auto Encrypted Session Refresh
 abstract class ApiClientService {
-  // Singleton သို့မဟုတ် Shared Instance အဖြစ် သုံးနိုင်ရန် Dio ကို Setup လုပ်ပါသည်
+  // Main dio client instance
   final Dio dio = Dio();
   final CookieJar cookieJar = CookieJar();
 
-  // Auto Login ပြန်ဝင်ရန်အတွက် သိမ်းထားမည့် အချက်အလက်များ
-  String? _savedUsername;
-  String? _savedPassword;
-  String? _savedDatabase;
-  String? _savedBaseUrl;
+  // 🔥 iOS/Android အတွက် ပိုမိုလုံခြုံသော Encrypted Storage Instance
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    iOptions: IOSOptions(accessibility: KeychainAccessibility.first_unlock),
+  );
+
+  // Storage Keys Constants
+  static const String _keyUsername = 'odoo_saved_username';
+  static const String _keyPassword = 'odoo_saved_password';
+  static const String _keyDatabase = 'odoo_saved_database';
+  static const String _keyBaseUrl = 'odoo_saved_base_url';
 
   ApiClientService() {
-    // CookieManager ထည့်သွင်းခြင်းဖြင့် Cookie များကို ဖိုင်/မန်မိုရီထဲ အလိုအလျောက် မှတ်ထားမည်
+    // Base Timeout Settings
+    dio.options.connectTimeout = const Duration(seconds: 15);
+    dio.options.receiveTimeout = const Duration(seconds: 15);
+
+    // CookieManager ထည့်သွင်းခြင်း
     dio.interceptors.add(CookieManager(cookieJar));
 
-    // Session သက်တမ်းကုန်ပါက ကြားဖြတ်ဖမ်းယူမည့် Interceptor
-    dio.interceptors.add(QueuedInterceptorsWrapper(
-      onResponse: (response, handler) async {
-        if (response.data is Map && response.data['error'] != null) {
-          final errorData = response.data['error']['data'];
-          final errorName = errorData?['name'] ?? "";
-
-          // Odoo Session Expired ဖြစ်သွားကြောင်း စစ်ဆေးခြင်း
-          if (errorName == 'odoo.http.SessionExpiredException' || errorName.contains('SessionExpired')) {
-            debugPrint('⚠️ Odoo Session Expired! Attempting auto-login refresh...');
-
-            // နောက်ကွယ်ကနေ Login အသစ် ပြန်ဝင်ခြင်း
-            bool isRefreshed = await _refreshSession();
-
-            if (isRefreshed) {
-              debugPrint('🔄 Session refreshed successfully. Retrying original request.');
-              // ရရှိလာသည့် Cookie အသစ်ဖြင့် ယခင်ပျက်သွားသော Request ကို အသစ်ပြန်ပို့ခြင်း
-              final requestOptions = response.requestOptions;
-              final cloneResponse = await dio.fetch(requestOptions);
-              return handler.resolve(cloneResponse);
-            }
+    // Session သက်တမ်းကုန်ပါက ကြားဖြတ်ဖမ်းယူမည့် Interceptor Logic
+    dio.interceptors.add(
+      QueuedInterceptorsWrapper(
+        onResponse: (response, handler) async {
+          // Retry Request ဖြစ်ပါက ထပ်မစစ်ဘဲ ကျော်သွားရန်
+          if (response.requestOptions.extra['is_retry'] == true) {
+            return handler.next(response);
           }
-        }
-        return handler.next(response);
-      },
-    ));
-  }
 
-  // Session သက်တမ်းကုန်ချိန်တွင် ခေါ်မည့် သီးသန့် အလိုအလျောက် Login Function
+          try {
+            if (response.data is Map && response.data['error'] != null) {
+              final errorData = response.data['error']['data'];
+              final errorName = errorData?['name'] ?? "";
+
+              if (errorName == 'odoo.http.SessionExpiredException' || errorName.contains('SessionExpired')) {
+                debugPrint('⚠️ Odoo Session Expired! Attempting auto-login refresh...');
+
+                // ၁။ Fresh Client ဖြင့် Login ပြန်ဝင်ခြင်း
+                bool isRefreshed = await _refreshSession();
+
+                if (isRefreshed) {
+                  debugPrint('🔄 Session refreshed successfully. Building isolated retry client...');
+
+                  final requestOptions = response.requestOptions;
+
+                  // ၂။ ရလာတဲ့ Cookie အသစ်ကို မူရင်း URI အတွက် ဆွဲထုတ်ယူခြင်း
+                  final cookies = await cookieJar.loadForRequest(requestOptions.uri);
+                  final cookieString = cookies.map((c) => '${c.name}=${c.value}').join('; ');
+
+                  final retryHeaders = Map<String, dynamic>.from(requestOptions.headers);
+                  retryHeaders.remove('Cookie');
+                  if (cookieString.isNotEmpty) {
+                    retryHeaders['Cookie'] = cookieString;
+                  }
+
+                  // 🎯 [CRITICAL FIX] Interceptor Queue Deadlock ကင်းဝေးစေရန်
+                  // ယာယီ Clean Dio Client အသစ်တစ်ခု ဆောက်၍ ၎င်းဖြင့်သာ Retry ပစ်ပါမည်။
+                  final retryDio = Dio();
+                  retryDio.options.connectTimeout = const Duration(seconds: 15);
+                  retryDio.options.receiveTimeout = const Duration(seconds: 15);
+
+                  debugPrint('🚀 Retrying original request via absolute clean retry client...');
+
+                  // ၃။ ပိတ်ဆို့မှုမရှိသော retryDio ဖြင့် ဒေတာ သွားဆွဲခိုင်းခြင်း
+                  final cloneResponse = await retryDio.requestUri(
+                    requestOptions.uri,
+                    data: requestOptions.data,
+                    options: Options(
+                      method: requestOptions.method,
+                      headers: retryHeaders,
+                      contentType: requestOptions.contentType,
+                      responseType: requestOptions.responseType,
+                    ),
+                  );
+
+                  debugPrint('🎉 Retry request completed successfully! Returning data to UI layer.');
+
+                  // ၄။ ရလာတဲ့ response အသစ်ကို မူရင်းပိတ်မိနေတဲ့ နေရာမှာ အစားထိုးဖြေရှင်း (Resolve) ပေးလိုက်ခြင်း
+                  return handler.resolve(cloneResponse);
+                } else {
+                  debugPrint('❌ Auto refresh login failed. Rejecting request.');
+                  return handler.reject(
+                    DioException(
+                      requestOptions: response.requestOptions,
+                      response: response,
+                      type: DioExceptionType.badResponse,
+                      message: "Odoo Session Expired & Auto-Refresh Failed",
+                    ),
+                  );
+                }
+              }
+            }
+            return handler.next(response);
+          } catch (e, stackTrace) {
+            debugPrint('🚨 Critical Exception caught inside Interceptor onResponse: $e');
+            debugPrint('🚨 StackTrace: $stackTrace');
+
+            return handler.reject(
+              DioException(
+                requestOptions: response.requestOptions,
+                response: response,
+                type: DioExceptionType.unknown,
+                error: e,
+                message: "Interceptor Error during session auto-refresh: $e",
+              ),
+            );
+          }
+        },
+      ),
+    );
+  }
+  // 🔥 [🎯 CRITICAL FIX] Interceptor Loop မပတ်စေရန် Clean Isolated Dio ဖြင့် သီးသန့်မောင်းနှင်သော Auto Login Function
   Future<bool> _refreshSession() async {
-    if (_savedUsername == null || _savedPassword == null || _savedDatabase == null || _savedBaseUrl == null) {
-      return false;
-    }
     try {
-      await cookieJar.deleteAll(); // ကွတ်ကီးအဟောင်းများ ဖျက်ပါ
-      final response = await dio.post(
-        '$_savedBaseUrl/web/session/authenticate',
+      final username = await _secureStorage.read(key: _keyUsername);
+      final password = await _secureStorage.read(key: _keyPassword);
+      final database = await _secureStorage.read(key: _keyDatabase);
+      final baseUrl = await _secureStorage.read(key: _keyBaseUrl);
+
+      debugPrint('🔍 Attempting auto-refresh with stored credentials: username=$username, database=$database, baseUrl=$baseUrl');
+      if (username == null || password == null || database == null || baseUrl == null) {
+        debugPrint('❌ Auto refresh aborted: No credentials found in Secure Storage.');
+        return false;
+      }
+
+      // ကွတ်ကီးအဟောင်းများ အကုန်ရှင်းထုတ်ပစ်ပါ
+      await cookieJar.deleteAll();
+
+      // 🎯 [FIX] ပင်မ dio ကြီးကို မသုံးဘဲ Interceptor ကင်းစင်သော ယာယီ Fresh Client အသစ်တစ်ခုကို သုံး၍ သွားခေါ်ပါသည်
+      final cleanDio = Dio();
+      cleanDio.options.connectTimeout = const Duration(seconds: 10);
+      cleanDio.options.receiveTimeout = const Duration(seconds: 10);
+
+      final response = await cleanDio.post(
+        '$baseUrl/web/session/authenticate',
         data: {
-          'params': {
-            'db': _savedDatabase,
-            'login': _savedUsername,
-            'password': _savedPassword,
-            'context': {}
-          },
+          'params': {'db': database, 'login': username, 'password': password, 'context': {}},
         },
       );
-      return response.statusCode == 200 && response.data['result'] != null;
+
+      if (response.statusCode == 200 && response.data != null) {
+        if (response.data['error'] != null) {
+          debugPrint('❌ Odoo Re-Auth Logic Error: ${response.data['error']}');
+          return false;
+        }
+
+        debugPrint('✅ Auto login refresh response successful: ${response.data['result'] != null}');
+
+        // 🎯 [FIX] Clean Dio မှ ရလာသော Set-Cookie Header ဒေတာအသစ်များကို ပင်မ Global CookieJar ထဲသို့ Manual ပြန်ပြောင်းသိမ်းပေးခြင်း
+        final rawCookies = response.headers['set-cookie'];
+        if (rawCookies != null) {
+          final uri = Uri.parse(baseUrl);
+          final cookies = rawCookies.map((str) => Cookie.fromSetCookieValue(str)).toList();
+          await cookieJar.saveFromResponse(uri, cookies);
+          debugPrint('💾 Successfully synchronized new session cookies to global CookieJar.');
+        }
+
+        return response.data['result'] != null;
+      }
+
+      return false;
     } catch (e) {
-      debugPrint('❌ Auto login refresh failed: $e');
+      debugPrint('❌ Auto login refresh failed via fresh isolated network client: $e');
       return false;
     }
   }
 
-  Future<RPCAuthResponse> authRPC({
-    required String username,
-    required String password,
-    required String database,
-    required String baseUrl,
-  }) async {
-    // တန်ဖိုးများကို သိမ်းဆည်းထားမည် (Timeout ဖြစ်လျှင် ပြန်သုံးရန်)
-    _savedUsername = username;
-    _savedPassword = password;
-    _savedDatabase = database;
-    _savedBaseUrl = baseUrl;
-
+  Future<RPCAuthResponse> authRPC({required String username, required String password, required String database, required String baseUrl}) async {
     RPCAuthResponse responseModel = RPCAuthResponse('Authentication failed');
     try {
       final response = await dio.post(
@@ -99,8 +194,12 @@ abstract class ApiClientService {
         final result = response.data['result'];
 
         if (result != null) {
-          // CookieManager သုံးထားသဖြင့် _extractCookies လုပ်ရန် မလိုတော့ပါ။ (Memory ထဲ သိမ်းပြီးသားဖြစ်သည်)
-          // လိုအပ်ပါက အောက်ပါအတိုင်း ကွတ်ကီးကို စာသားပြောင်းယူနိုင်သည်
+          // 🔥 Login ပထမဆုံးအကြိမ် အောင်မြင်မှသာ အချက်အလက်များကို Secure Storage ထဲသို့ Encrypt လုပ်၍ အသေသိမ်းမည်
+          await _secureStorage.write(key: _keyUsername, value: username);
+          await _secureStorage.write(key: _keyPassword, value: password);
+          await _secureStorage.write(key: _keyDatabase, value: database);
+          await _secureStorage.write(key: _keyBaseUrl, value: baseUrl);
+
           final cookies = await cookieJar.loadForRequest(Uri.parse(baseUrl));
           final cookieString = cookies.map((c) => '${c.name}=${c.value}').join('; ');
 
@@ -144,8 +243,14 @@ abstract class ApiClientService {
     return responseModel;
   }
 
-  // သတိပြုရန် - CookieManager သုံးထားသဖြင့် အောက်ပါ function များတွင် 'String cookies' parameter ထည့်ပေးရန် မလိုတော့ပါ။
-  // dio မှ အလိုအလျောက် Header ထဲ ထည့်ပေးသွားမည် ဖြစ်သည်။
+  // 🔥 Logout ပြုလုပ်လိုပါက Storage နှင့် Cookie များကို တစ်ခါတည်း ရှင်းလင်းပေးမည့် Helper Function
+  Future<void> clearSecureCredentials() async {
+    await _secureStorage.deleteAll();
+    await cookieJar.deleteAll();
+    debugPrint('🧹 Cleared all secure storage credentials and cookie sessions.');
+  }
+
+  // --- ကျန်ရှိသော REST API နှင့် RPC Method ကုဒ်များ ပြောင်းလဲမှုမရှိပါ (မူလအတိုင်း ဆက်လက်ရှိနေမည်ဖြစ်သည်) ---
 
   Future<ClientResponse> changePasswordRPC(String oldValue, String newValue, String baseUrl, String model) async {
     try {
@@ -196,7 +301,9 @@ abstract class ApiClientService {
           "params": {
             "model": model,
             "method": "unlink",
-            "args": [[id]],
+            "args": [
+              [id],
+            ],
             "kwargs": {},
           },
         },
@@ -233,10 +340,7 @@ abstract class ApiClientService {
     required T Function(Map<String, dynamic>) fromJson,
   }) async {
     try {
-      final response = await dio.post(
-        '$baseUrl/web/dataset/call_kw',
-        data: request.toJson(),
-      );
+      final response = await dio.post('$baseUrl/web/dataset/call_kw', data: request.toJson());
 
       if (response.statusCode == 200) {
         final odooRes = OdooErrorResponse.fromJson(response.data);
@@ -262,16 +366,9 @@ abstract class ApiClientService {
     }
   }
 
-  Future<ClientResponse<T>> getRPC<T>({
-    required String baseUrl,
-    required ClientGetRequest request,
-    required T Function(Map<String, dynamic>) fromJson,
-  }) async {
+  Future<ClientResponse<T>> getRPC<T>({required String baseUrl, required ClientGetRequest request, required T Function(Map<String, dynamic>) fromJson}) async {
     try {
-      final response = await dio.post(
-        '$baseUrl/web/dataset/call_kw',
-        data: request.toJson(),
-      );
+      final response = await dio.post('$baseUrl/web/dataset/call_kw', data: request.toJson());
       if (response.statusCode == 200) {
         final odooRes = OdooErrorResponse.fromJson(response.data);
         if (odooRes.error != null) {
@@ -302,10 +399,7 @@ abstract class ApiClientService {
     required T Function(Map<String, dynamic>) fromJson,
   }) async {
     try {
-      final response = await dio.post(
-        baseUrl,
-        data: request,
-      );
+      final response = await dio.post(baseUrl, data: request);
       if (response.statusCode == 200) {
         final odooRes = OdooErrorResponse.fromJson(response.data);
         if (odooRes.error != null) {
@@ -340,10 +434,7 @@ abstract class ApiClientService {
 
   Future<ClientResponse<T>> createRPC<T>(ClientRPCPostRequest request, String baseUrl) async {
     try {
-      final response = await dio.post(
-        '$baseUrl/web/dataset/call_kw',
-        data: request.toJson(),
-      );
+      final response = await dio.post('$baseUrl/web/dataset/call_kw', data: request.toJson());
 
       if (response.statusCode == 200) {
         final odooRes = OdooErrorResponse.fromJson(response.data);
@@ -373,8 +464,6 @@ abstract class ApiClientService {
       return ClientResponse(statusCode: 500, message: e.message ?? "Unknown Dio error", data: null);
     }
   }
-
-  // --- REST API Method များ (ထည့်သွင်းပြင်ဆင်ပြီး) ---
 
   Future<ClientListResponse<R>> getAllRest<T extends QueryParamSerializable, R>({
     required String url,
@@ -458,7 +547,7 @@ abstract class ApiClientService {
     }
   }
 
-  Future<ClientResponse?> createRest<T>(String baseUrl, String param, String? token, T? data, String type) async {
+  Future<ClientResponse> createRest<T>(String baseUrl, String param, String? token, T? data, String type) async {
     final options = token != null
         ? Options(headers: {'Authorization': 'Bearer $token'}, receiveTimeout: const Duration(seconds: 5))
         : Options(receiveTimeout: const Duration(seconds: 5));
@@ -469,7 +558,11 @@ abstract class ApiClientService {
 
       return ClientResponse(statusCode: response.statusCode ?? 200, message: response.statusMessage ?? 'Created', data: response.data);
     } on DioException catch (dioError) {
-      return ClientResponse(statusCode: dioError.response?.statusCode ?? 400, message: dioError.response?.statusMessage ?? 'Request Error', data: dioError.response?.data);
+      return ClientResponse(
+        statusCode: dioError.response?.statusCode ?? 400,
+        message: dioError.response?.statusMessage ?? 'Request Error',
+        data: dioError.response?.data,
+      );
     } catch (e) {
       return ClientResponse(statusCode: 500, message: e.toString(), data: null);
     }
